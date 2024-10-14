@@ -75,7 +75,7 @@ if __name__ == '__main__':
 
     # === Network definition ===========================================================================================
 
-    parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "ace_encoder_pretrained.pt",
+    parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "xfeat.pt",
                         help='file containing pre-trained encoder weights')
 
     parser.add_argument('--load_weights', type=Path, help='path to initialised network weights', default=None)

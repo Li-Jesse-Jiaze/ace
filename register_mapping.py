@@ -48,7 +48,7 @@ if __name__ == '__main__':
 
     parser.add_argument('network', type=Path, help='path to a network trained for the scene (just the head weights)')
 
-    parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "ace_encoder_pretrained.pt",
+    parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "xfeat.pt",
                         help='file containing pre-trained encoder weights')
 
     parser.add_argument('--session', '-sid', default='',

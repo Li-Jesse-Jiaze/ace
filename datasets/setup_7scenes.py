@@ -12,7 +12,7 @@ from skimage import io
 
 # name of the folder where we download the original 7scenes dataset to
 # we restructure the dataset by creating symbolic links to that folder
-src_folder = '7scenes'
+src_folder = '7scenes_source'
 focal_length = 525.0
 
 # focal length of the depth sensor (source: https://www.microsoft.com/en-us/research/project/rgb-d-dataset-7-scenes/)
@@ -39,24 +39,14 @@ if __name__ == '__main__':
         description='Download and setup the 7Scenes dataset.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    parser.add_argument('--setup_ace_structure', action='store_true',
-                        help='Create a copy of the dataset in the ACE format in 7scenes_ace. '
-                             'Otherwise, the dataset is left in the original format in 7scenes.')
-
     parser.add_argument('--depth', type=str, choices=['none', 'rendered', 'calibrated'], default='none',
-                        help='For ACE dataset format only. '
-                             'none: ignore depth maps; '
-                             'rendered: download depth rendered using 3D scene model (28GB); '
-                             'calibrated: register original depth maps to RGB')
+                        help='none: ignore depth maps; rendered: download depth rendered using 3D scene model (28GB); calibrated: register original depth maps to RGB')
 
     parser.add_argument('--eye', type=str, choices=['none', 'calibrated'], default='none',
-                        help='For ACE dataset format only. '
-                             'none: ignore eye coordinates; '
-                             'original: calibrate original depth maps and precompute eye coordinates')
+                        help='none: ignore eye coordinates; original: calibrate original depth maps and precompute eye coordinates')
 
     parser.add_argument('--poses', type=str, choices=['original', 'calibrated', 'pgt'], default='calibrated',
-                        help='For ACE dataset format only. '
-                             'original: use raw poses of depth sensor; '
+                        help='original: use raw poses of depth sensor; '
                              'calibrated: register poses to RGB sensor; '
                              'pgt: get SfM poses from external repository (Brachmann et al., ICCV21)')
 
@@ -112,18 +102,15 @@ if __name__ == '__main__':
         else:
             print(f"Found data of scene {ds} already. Assuming its complete and skipping download.")
 
-    if not opt.setup_ace_structure:
-        print("ACE dataset format not requested. Done.")
-        exit()
-
     print("Processing frames...")
+
 
     def process_scene(ds):
 
         if opt.poses == 'pgt':
-            target_folder = '../7scenes_ace/pgt_7scenes_' + ds + '/'
+            target_folder = '../pgt_7scenes_' + ds + '/'
         else:
-            target_folder = '../7scenes_ace/kf_7scenes_' + ds + '/'
+            target_folder = '../7scenes_' + ds + '/'
 
         def link_frames(split_file, variant):
 

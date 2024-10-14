@@ -36,7 +36,7 @@ if __name__ == '__main__':
     parser.add_argument('--visualization_buffer', type=Path,
                         help='Vis buffer files that contains a pre-calculated point cloud.')
 
-    parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "ace_encoder_pretrained.pt",
+    parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "xfeat.pt",
                         help='file containing pre-trained encoder weights')
 
     parser.add_argument('--image_resolution', type=int, default=480, help='base image resolution')
