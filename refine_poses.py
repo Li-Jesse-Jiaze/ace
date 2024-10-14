@@ -12,66 +12,6 @@ import roma
 _logger = logging.getLogger(__name__)
 
 
-class PoseNetwork(nn.Module):
-    """
-    MLP network predicting a pose update.
-    It takes 12 inputs (3x4 pose) and predicts 12 values, e.g. used as additive offsets.
-    """
-
-    def __init__(self, num_head_blocks, channels=512):
-        super(PoseNetwork, self).__init__()
-
-        self.in_channels = 12
-        self.head_channels = channels  # Hardcoded.
-
-        # We may need a skip layer if the number of features output by the encoder is different.
-        self.head_skip = nn.Identity() if self.in_channels == self.head_channels else nn.Conv2d(self.in_channels,
-                                                                                                self.head_channels, 1,
-                                                                                                1, 0)
-
-        self.conv1 = nn.Conv2d(self.in_channels, self.head_channels, 1, 1, 0)
-        self.conv2 = nn.Conv2d(self.head_channels, self.head_channels, 1, 1, 0)
-        self.conv3 = nn.Conv2d(self.head_channels, self.head_channels, 1, 1, 0)
-
-        self.res_blocks = []
-
-        for block in range(num_head_blocks):
-            self.res_blocks.append((
-                nn.Conv2d(self.head_channels, self.head_channels, 1, 1, 0),
-                nn.Conv2d(self.head_channels, self.head_channels, 1, 1, 0),
-                nn.Conv2d(self.head_channels, self.head_channels, 1, 1, 0),
-            ))
-
-            super(PoseNetwork, self).add_module(str(block) + 'c0', self.res_blocks[block][0])
-            super(PoseNetwork, self).add_module(str(block) + 'c1', self.res_blocks[block][1])
-            super(PoseNetwork, self).add_module(str(block) + 'c2', self.res_blocks[block][2])
-
-        self.fc1 = nn.Conv2d(self.head_channels, self.head_channels, 1, 1, 0)
-        self.fc2 = nn.Conv2d(self.head_channels, self.head_channels, 1, 1, 0)
-        self.fc3 = nn.Conv2d(self.head_channels, 12, 1, 1, 0)
-
-    def forward(self, res):
-
-        x = F.relu(self.conv1(res))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-
-        res = self.head_skip(res) + x
-
-        for res_block in self.res_blocks:
-            x = F.relu(res_block[0](res))
-            x = F.relu(res_block[1](x))
-            x = F.relu(res_block[2](x))
-
-            res = res + x
-
-        pose_update = F.relu(self.fc1(res))
-        pose_update = F.relu(self.fc2(pose_update))
-        pose_update = self.fc3(pose_update)
-
-        return pose_update
-
-
 def skew_symmetric(omega):
     """
     Compute skew-symmetric matrix of omega
@@ -217,12 +157,6 @@ class PoseRefiner:
             # back-prop to pose parameters (Lie algebra elements) directly
             self.pose_buffer = self.pose_buffer.detach().requires_grad_()
             self.pose_optimizer = optim.AdamW([self.pose_buffer], lr=self.learning_rate)
-        else:
-            # use small network to predict pose updates
-            self.pose_network = PoseNetwork(0, 128)
-            self.pose_network = self.pose_network.to(self.device)
-            self.pose_network.train()
-            self.pose_optimizer = optim.AdamW(self.pose_network.parameters(), lr=self.learning_rate)
 
     def get_all_original_poses(self):
         """
@@ -247,20 +181,6 @@ class PoseRefiner:
             current_SE3_N44 = se3_exp(current_params)  # (N,4,4)
 
             return current_SE3_N44
-        else:
-            # predict pose updates with current state of the network
-            with torch.no_grad():
-                # return current state of the pose buffer
-                output_params = self.pose_buffer.clone()
-
-                # predict current poses
-                # Note: For 'mlp' strategy, we need to modify this part accordingly
-                output_poses = self.pose_buffer_orig.to(self.device)
-                predicted_updates = self.pose_network(output_poses.view(-1, 12, 1, 1))
-                updated_params = output_params + self.update_weight * predicted_updates.view(-1, 6)
-                current_SE3_N44 = se3_exp(updated_params)
-
-                return current_SE3_N44
 
     def get_current_poses(self, original_poses_b44, original_poses_indices):
         """
@@ -278,14 +198,6 @@ class PoseRefiner:
 
             # Compute SE(3) matrices by exponential map
             current_SE3_b44 = se3_exp(current_params_b6)  # (b,4,4)
-
-            return current_SE3_b44
-        else:
-            # predict pose updates with current state of the network
-            output_poses = self.pose_buffer_orig[original_poses_indices].to(self.device)
-            predicted_updates = self.pose_network(output_poses.view(-1, 12, 1, 1))
-            updated_params = output_poses + self.update_weight * predicted_updates.view(-1, 6)
-            current_SE3_b44 = se3_exp(updated_params)
 
             return current_SE3_b44
 
