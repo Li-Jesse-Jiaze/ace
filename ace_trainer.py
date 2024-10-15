@@ -633,7 +633,7 @@ class TrainerACE:
 
         if self.iteration > self.options.pose_refinement_wait:
             # Only update poses after initial wait period (if set)
-            self.pose_refiner.step()
+            self.pose_refiner.step(loss)
 
         if self.K_optimizer is not None:
             # Only update calibration if it is being refined

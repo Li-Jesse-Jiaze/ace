@@ -9,6 +9,72 @@ import roma
 
 _logger = logging.getLogger(__name__)
 
+class LMOptimizer(optim.Optimizer):
+    def __init__(self, params, lr=1e-3, lambda_init=1e-3, lambda_increase=10, lambda_decrease=10, max_iter=20):
+        """
+        Levenberg-Marquardt Optimizer.
+
+        Args:
+            params (iterable): Parameters to optimize.
+            lr (float): Learning rate scaling factor.
+            lambda_init (float): Initial damping factor.
+            lambda_increase (float): Factor to increase lambda when loss increases.
+            lambda_decrease (float): Factor to decrease lambda when loss decreases.
+            max_iter (int): Maximum iterations per step (not used here but kept for compatibility).
+        """
+        defaults = dict(lr=lr, lambda_=lambda_init, lambda_increase=lambda_increase, 
+                        lambda_decrease=lambda_decrease, max_iter=max_iter)
+        super(LMOptimizer, self).__init__(params, defaults)
+
+    def step(self, loss):
+        """
+        Performs a single optimization step.
+
+        Args:
+            loss (torch.Tensor): The current loss tensor.
+        """
+        loss.backward()
+
+        for group in self.param_groups:
+            lambda_ = group['lambda_']
+            lr = group['lr']
+
+            params = group['params']
+            # Collect gradients and flatten them
+            grads = []
+            for p in params:
+                if p.grad is None:
+                    grads.append(torch.zeros_like(p))
+                else:
+                    grads.append(p.grad.flatten())
+            grads = torch.cat(grads) * 1e-2  # (num_params,)
+
+            # Compute JTJ (approximate Hessian)
+            JTJ = torch.ger(grads, grads)  # Outer product (num_params, num_params)
+
+            # Add damping factor to the diagonal
+            JTJ += lambda_ * torch.eye(JTJ.size(0), device=JTJ.device)
+
+            # Compute the parameter update
+            try:
+                delta = -torch.linalg.solve(JTJ, grads)
+            except RuntimeError:
+                # In case JTJ is singular, use pseudo-inverse
+                delta = -torch.matmul(torch.pinverse(JTJ), grads)
+
+            # Scale delta by learning rate
+            delta = delta * lr
+
+            # Apply the update to parameters
+            with torch.no_grad():
+                idx = 0
+                for p in params:
+                    numel = p.numel()
+                    if p.grad is not None:
+                        delta_p = delta[idx:idx+numel].view_as(p)
+                        p.add_(delta_p)
+                    idx += numel
+
 
 def se3_exp(xi):
     """
@@ -66,6 +132,7 @@ class PoseRefiner:
         self.learning_rate = options.pose_refinement_lr
         self.update_weight = options.pose_refinement_weight
         self.orthonormalization = options.refinement_ortho
+        self.max_iter = options.iterations - options.pose_refinement_wait
 
         # pose buffer for current estimate of refined poses
         self.pose_buffer = None
@@ -97,8 +164,8 @@ class PoseRefiner:
         elif self.refinement_strategy == 'naive':
             # Initialize delta pose_buffer as zeros (no change)
             self.pose_buffer = torch.zeros(len(self.dataset), 6, device=self.device, requires_grad=True)
-            # Set up optimizer to optimize delta poses
-            self.pose_optimizer = optim.AdamW([self.pose_buffer], lr=self.learning_rate)
+            # Set up LM optimizer to optimize delta poses
+            self.pose_optimizer = LMOptimizer([self.pose_buffer], lr=self.learning_rate, max_iter=self.max_iter)
 
     def get_all_original_poses(self):
         """
@@ -140,8 +207,15 @@ class PoseRefiner:
 
     def zero_grad(self, set_to_none=False):
         if self.pose_optimizer is not None:
-            self.pose_optimizer.zero_grad(set_to_none=set_to_none)
+            # Manually zero the gradients of pose_buffer
+            self.pose_buffer.grad.zero_() if self.pose_buffer.grad is not None else None
 
-    def step(self):
+    def step(self, loss):
+        """
+        Performs a single optimization step.
+
+        Args:
+            loss (torch.Tensor): The current loss tensor.
+        """
         if self.pose_optimizer is not None:
-            self.pose_optimizer.step()
+            self.pose_optimizer.step(loss)
