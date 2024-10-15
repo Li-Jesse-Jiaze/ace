@@ -3,34 +3,11 @@
 import logging
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch import optim
 
 import roma
 
 _logger = logging.getLogger(__name__)
-
-
-def skew_symmetric(omega):
-    """
-    Compute skew-symmetric matrix of omega
-    omega: (N,3)
-    Returns: (N,3,3)
-    """
-    N = omega.shape[0]
-    zero = torch.zeros(N, 1).to(omega.device)
-    omega_x = omega[:, 0].unsqueeze(1)
-    omega_y = omega[:, 1].unsqueeze(1)
-    omega_z = omega[:, 2].unsqueeze(1)
-
-    row0 = torch.cat([zero, -omega_z, omega_y], dim=1)
-    row1 = torch.cat([omega_z, zero, -omega_x], dim=1)
-    row2 = torch.cat([-omega_y, omega_x, zero], dim=1)
-
-    skew = torch.stack([row0, row1, row2], dim=1)  # (N,3,3)
-
-    return skew
 
 
 def se3_exp(xi):
@@ -41,29 +18,11 @@ def se3_exp(xi):
     """
     omega = xi[:, :3]  # (N,3)
     v = xi[:, 3:]      # (N,3)
-
-    theta = omega.norm(dim=1, keepdim=True)  # (N,1)
-    epsilon = 1e-8
-    theta = theta + epsilon
-
-    omega_hat = skew_symmetric(omega)  # (N,3,3)
-
-    # Rodrigues' formula for rotation matrix
-    A = torch.sin(theta) / theta       # (N,1)
-    B = (1 - torch.cos(theta)) / (theta ** 2)  # (N,1)
-    C = (1 - A) / (theta ** 2)         # (N,1)
-
-    E = torch.eye(3).unsqueeze(0).to(xi.device)  # (1,3,3)
-
-    R = E + A.view(-1,1,1) * omega_hat + B.view(-1,1,1) * torch.bmm(omega_hat, omega_hat)  # (N,3,3)
-    V = E + B.view(-1,1,1) * omega_hat + C.view(-1,1,1) * torch.bmm(omega_hat, omega_hat)  # (N,3,3)
-
-    t = torch.bmm(V, v.unsqueeze(-1)).squeeze(-1)  # (N,3)
-
+    R = roma.rotvec_to_rotmat(omega)
     # Construct SE(3) matrices
     SE3 = torch.zeros(xi.shape[0], 4, 4).to(xi.device)
     SE3[:, :3, :3] = R
-    SE3[:, :3, 3] = t
+    SE3[:, :3, 3] = v
     SE3[:, 3, 3] = 1.0
 
     return SE3
@@ -77,22 +36,8 @@ def se3_log(SE3):
     """
     R = SE3[:, :3, :3]  # (N,3,3)
     t = SE3[:, :3, 3]   # (N,3)
-
-    omega = roma.mappings.rotmat_to_rotvec(R)  # (N,3)
-    theta = omega.norm(dim=1, keepdim=True)  # (N,1)
-    epsilon = 1e-8
-    theta = theta + epsilon
-
-    omega_hat = skew_symmetric(omega)  # (N,3,3)
-
-    # Compute V_inv
-    half_theta = 0.5 * theta
-    cot_half_theta = 1.0 / torch.tan(half_theta)
-    V_inv = (torch.eye(3).to(SE3.device).unsqueeze(0) - 0.5 * omega_hat + (1.0 / theta**2) * (1 - (theta * cot_half_theta) / 2) * torch.bmm(omega_hat, omega_hat))
-
-    v = torch.bmm(V_inv, t.unsqueeze(-1)).squeeze(-1)  # (N,3)
-
-    xi = torch.cat([omega, v], dim=1)  # (N,6)
+    omega = roma.rotmat_to_rotvec(R)
+    xi = torch.cat([omega, t], dim=1)  # (N,6)
 
     return xi
 
@@ -124,7 +69,7 @@ class PoseRefiner:
 
         # pose buffer for current estimate of refined poses
         self.pose_buffer = None
-        # pose buffer for original poses
+        # pose buffer for original poses (using Lie group SE(3))
         self.pose_buffer_orig = None
         # network predicting pose updates (depending on the optimization strategy)
         self.pose_network = None
@@ -135,52 +80,44 @@ class PoseRefiner:
         """
         Populate internal pose buffers and set up the pose optimization strategy.
         """
-        self.pose_buffer_orig = torch.zeros(len(self.dataset), 6)
+        if self.refinement_strategy == 'mlp':
+            raise NotImplementedError("MLP refinement strategy is not implemented in this modification.")
 
-        # fill pose buffer with Lie algebra elements (omega and translation)
+        # Initialize pose_buffer_orig as SE(3) matrices
+        self.pose_buffer_orig = torch.zeros(len(self.dataset), 4, 4).to(self.device)
+
         for pose_idx, pose in enumerate(self.dataset.poses):
-            # Convert pose to 4x4 matrix
-            pose_matrix = torch.eye(4)
-            pose_matrix[:3, :4] = pose.inverse().clone()[:3, :4]  # (4, 4)
+            pose_matrix = pose.inverse().clone()  # (4, 4)
+            self.pose_buffer_orig[pose_idx] = pose_matrix
 
-            # Compute logarithm map of SE(3) to get xi (omega and v)
-            xi = se3_log(pose_matrix.unsqueeze(0))  # (1,6)
-            self.pose_buffer_orig[pose_idx] = xi.squeeze()
-
-        self.pose_buffer = self.pose_buffer_orig.contiguous().to(self.device, non_blocking=True)
-
-        # set the pose optimization strategy
         if self.refinement_strategy == 'none':
-            # will keep original poses
-            pass
+            # No optimization needed; poses remain as original
+            return
+
         elif self.refinement_strategy == 'naive':
-            # back-prop to pose parameters (Lie algebra elements) directly
-            self.pose_buffer = self.pose_buffer.detach().requires_grad_()
+            # Initialize delta pose_buffer as zeros (no change)
+            self.pose_buffer = torch.zeros(len(self.dataset), 6, device=self.device, requires_grad=True)
+            # Set up optimizer to optimize delta poses
             self.pose_optimizer = optim.AdamW([self.pose_buffer], lr=self.learning_rate)
 
     def get_all_original_poses(self):
         """
-        Get all original poses.
+        Get all original poses as SE(3) matrices.
         """
-        # Convert Lie algebra elements back to SE(3) matrices
-        poses_b44 = se3_exp(self.pose_buffer_orig.to(self.device))
-        return poses_b44
+        return self.pose_buffer_orig.clone()
 
     def get_all_current_poses(self):
         """
         Get all current estimates of refined poses.
         """
         if self.refinement_strategy == 'none':
-            # just return original poses
+            # Just return original poses
             return self.get_all_original_poses()
         elif self.refinement_strategy == 'naive':
-            # return current state of the pose buffer
-            current_params = self.pose_buffer.clone()  # (N,6)
-
-            # Compute SE(3) matrices by exponential map
-            current_SE3_N44 = se3_exp(current_params)  # (N,4,4)
-
-            return current_SE3_N44
+            # Compute refined poses: delta_SE3 * original_pose
+            delta_SE3 = se3_exp(self.pose_buffer)  # (N,4,4)
+            refined_SE3 = torch.bmm(delta_SE3, self.pose_buffer_orig)  # (N,4,4)
+            return refined_SE3
 
     def get_current_poses(self, original_poses_b44, original_poses_indices):
         """
@@ -190,16 +127,16 @@ class PoseRefiner:
         @param original_poses_indices: indices of the original poses in the dataset
         """
         if self.refinement_strategy == 'none':
-            # just return original poses
+            # Just return original poses
             return original_poses_b44.clone()
         elif self.refinement_strategy == 'naive':
-            # get current state of the pose parameters (Lie algebra elements) from buffer
-            current_params_b6 = self.pose_buffer[original_poses_indices].squeeze()  # (b, 6)
-
-            # Compute SE(3) matrices by exponential map
-            current_SE3_b44 = se3_exp(current_params_b6)  # (b,4,4)
-
-            return current_SE3_b44
+            # Get delta_xi for the specified poses
+            delta_xi = self.pose_buffer[original_poses_indices.view(-1)].clone()  # (b,6)
+            # Compute delta SE(3)
+            delta_SE3 = se3_exp(delta_xi)  # (b,4,4)
+            # Compute refined poses: delta_SE3 * original_pose
+            refined_SE3 = torch.bmm(delta_SE3, original_poses_b44)  # (b,4,4)
+            return refined_SE3
 
     def zero_grad(self, set_to_none=False):
         if self.pose_optimizer is not None:
