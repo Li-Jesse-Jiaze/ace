@@ -104,7 +104,7 @@ class ScheduleACE:
         self.optimizer.zero_grad(set_to_none=set_to_none)
 
     def backward(self, loss):
-        self.scaler.scale(loss).backward(retain_graph=True)
+        self.scaler.scale(loss).backward()
 
     def step(self, batch_inliers):
 

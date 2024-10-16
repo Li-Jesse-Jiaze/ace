@@ -10,63 +10,89 @@ import roma
 _logger = logging.getLogger(__name__)
 
 class LMOptimizer(optim.Optimizer):
-    def __init__(self, params, lr=1e-3, lambda_init=1e-3, lambda_increase=10, lambda_decrease=10, max_iter=20):
+    def __init__(self, params, lr=1e-3, lambda_init=1e-3, max_iter=20, huber_delta=1.0):
         """
-        Levenberg-Marquardt Optimizer.
+        Levenberg-Marquardt Optimizer with Huber loss.
 
         Args:
             params (iterable): Parameters to optimize.
             lr (float): Learning rate scaling factor.
             lambda_init (float): Initial damping factor.
-            lambda_increase (float): Factor to increase lambda when loss increases.
-            lambda_decrease (float): Factor to decrease lambda when loss decreases.
-            max_iter (int): Maximum iterations per step (not used here but kept for compatibility).
+            max_iter (int): Maximum iterations per step.
+            huber_delta (float): The threshold parameter for Huber loss.
         """
-        defaults = dict(lr=lr, lambda_=lambda_init, lambda_increase=lambda_increase, 
-                        lambda_decrease=lambda_decrease, max_iter=max_iter)
+        defaults = dict(lr=lr, lambda_=lambda_init, max_iter=max_iter)
         super(LMOptimizer, self).__init__(params, defaults)
+        self.huber_delta = huber_delta
 
-    def step(self, loss):
+    def huber(self, residuals):
         """
-        Performs a single optimization step.
+        Apply the Huber loss to the residuals.
 
         Args:
-            loss (torch.Tensor): The current loss tensor.
+            residuals (torch.Tensor): The residuals tensor.
+
+        Returns:
+            torch.Tensor: Adjusted residuals.
+            torch.Tensor: Weights for each residual based on Huber derivative.
         """
-        loss.backward()
+        abs_res = torch.abs(residuals)
+        mask = abs_res <= self.huber_delta
+        adjusted_residuals = torch.where(
+            mask,
+            0.5 * residuals ** 2,
+            self.huber_delta * (abs_res - 0.5 * self.huber_delta),
+        )
+        # Derivative (for weighting)
+        weights = torch.where(
+            mask,
+            1.0,
+            self.huber_delta / abs_res
+        )
+        return adjusted_residuals, weights
 
-        for group in self.param_groups:
-            lambda_ = group['lambda_']
-            lr = group['lr']
+    def step(self, J: torch.Tensor, residuals: torch.Tensor):
+        """
+        Performs a single optimization step with Huber loss.
 
-            params = group['params']
-            # Collect gradients and flatten them
-            grads = []
-            for p in params:
-                if p.grad is None:
-                    grads.append(torch.zeros_like(p))
-                else:
-                    grads.append(p.grad.flatten())
-            grads = torch.cat(grads) * 1e-2  # (num_params,)
+        Args:
+            J (torch.Tensor): Jacobian matrix of shape (batch_size, num_residuals, num_params).
+            residuals (torch.Tensor): Residuals tensor of shape (batch_size, num_residuals).
 
-            # Compute JTJ (approximate Hessian)
-            JTJ = torch.ger(grads, grads)  # Outer product (num_params, num_params)
+        Returns:
+            loss (torch.Tensor): The Huber loss.
+        """
+        with torch.no_grad():
+            # Apply Huber loss to residuals
+            _, weights = self.huber(residuals)
+            # Optionally, you can compute the scalar loss here if needed
+            # loss = loss.mean()
 
-            # Add damping factor to the diagonal
-            JTJ += lambda_ * torch.eye(JTJ.size(0), device=JTJ.device)
+            # Weight the residuals and Jacobian
+            weighted_residuals = residuals * weights
+            weighted_J = J * weights.unsqueeze(-1)
 
-            # Compute the parameter update
-            try:
-                delta = -torch.linalg.solve(JTJ, grads)
-            except RuntimeError:
-                # In case JTJ is singular, use pseudo-inverse
-                delta = -torch.matmul(torch.pinverse(JTJ), grads)
+            # Compute gradient and Hessian
+            G = torch.einsum("bn,b->n", weighted_J, residuals * 1e-2)
+            H = torch.einsum("bn,bm->nm", weighted_J, weighted_J)
 
-            # Scale delta by learning rate
-            delta = delta * lr
+            for group in self.param_groups:
+                lambda_ = group['lambda_']
+                lr = group['lr']
 
-            # Apply the update to parameters
-            with torch.no_grad():
+                params = group['params']
+                diag = H.diagonal(dim1=-2, dim2=-1)
+                diag = diag * lambda_
+
+                H = H + diag.clamp(min=1e-8).diag_embed()
+                try:
+                    delta = -torch.linalg.solve(H, G)
+                except RuntimeError:
+                    # In case JTJ is singular, use pseudo-inverse
+                    delta = -torch.matmul(torch.pinverse(H), G)
+                # Scale delta by learning rate
+                delta = delta * lr
+
                 idx = 0
                 for p in params:
                     numel = p.numel()
@@ -167,6 +193,62 @@ class PoseRefiner:
             # Set up LM optimizer to optimize delta poses
             self.pose_optimizer = LMOptimizer([self.pose_buffer], lr=self.learning_rate, max_iter=self.max_iter)
 
+    def J_point_se3(self, pred_cam_coords_b31, pose_idx, Ks_b33):
+        pose_idx = pose_idx.flatten()
+        b = pred_cam_coords_b31.shape[0]
+        N = self.pose_buffer.shape[0]
+        device = pred_cam_coords_b31.device
+
+        X = pred_cam_coords_b31[:, 0, 0]
+        Y = pred_cam_coords_b31[:, 1, 0]
+        Z = pred_cam_coords_b31[:, 2, 0]
+        inv_z = 1.0 / Z
+        inv_z2 = inv_z ** 2
+        fx = Ks_b33[:, 0, 0]
+        fy = Ks_b33[:, 1, 1]
+
+        J11 = fx * X * Y * inv_z2
+        J12 = -fx - fx * X ** 2 * inv_z2
+        J13 = fx * Y * inv_z
+        J14 = -fx * inv_z
+        J15 = torch.zeros(b, device=device)
+        J16 = fx * X * inv_z2
+
+        J21 = fy + fy * Y ** 2 * inv_z2
+        J22 = -fy * X * Y * inv_z2
+        J23 = -fy * X * inv_z
+        J24 = torch.zeros(b, device=device)
+        J25 = -fy * inv_z
+        J26 = fy * Y * inv_z2
+
+        # Stack to form (b, 2, 6)
+        J_per_point = torch.stack([
+            torch.stack([J11, J12, J13, J14, J15, J16], dim=1),
+            torch.stack([J21, J22, J23, J24, J25, J26], dim=1)
+        ], dim=1)  # Shape: (b, 2, 6)
+
+        # Initialize J_full
+        J_full = torch.zeros((2 * b, 6 * N), device=device)  # Shape: (2b, 6N)
+
+        # Create row indices for the two rows per point
+        rows0 = torch.arange(b, device=device)
+        rows1 = torch.arange(b, device=device) + 1  # Adjust based on how rows are mapped
+
+        # Calculate the starting column indices
+        col_start = pose_idx * 6  # Assuming each pose index corresponds to 6 columns
+
+        # Expand to get all column indices for the 6 columns per pose
+        cols = col_start.unsqueeze(1) + torch.arange(6, device=device)  # Shape: (b, 6)
+
+        # Use index_add_ to add the first row of J_per_point
+        J_full.index_add_(0, rows0, torch.zeros((b, 6 * N), device=device).scatter_add(1, cols, J_per_point[:, 0, :]))
+
+        # Use index_add_ to add the second row of J_per_point
+        J_full.index_add_(0, rows1, torch.zeros((b, 6 * N), device=device).scatter_add(1, cols, J_per_point[:, 1, :]))
+
+        return J_full
+
+
     def get_all_original_poses(self):
         """
         Get all original poses as SE(3) matrices.
@@ -210,12 +292,9 @@ class PoseRefiner:
             # Manually zero the gradients of pose_buffer
             self.pose_buffer.grad.zero_() if self.pose_buffer.grad is not None else None
 
-    def step(self, loss):
+    def step(self, J, residuals):
         """
         Performs a single optimization step.
-
-        Args:
-            loss (torch.Tensor): The current loss tensor.
         """
         if self.pose_optimizer is not None:
-            self.pose_optimizer.step(loss)
+            self.pose_optimizer.step(J, residuals)
