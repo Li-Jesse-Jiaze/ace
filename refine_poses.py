@@ -9,6 +9,62 @@ import roma
 
 _logger = logging.getLogger(__name__)
 
+class LMOptimizer(optim.Optimizer):
+    def __init__(self, params, lr=1e-3, lambda_=1e-3, max_iter=20, loss_scale=1e-3):
+        """
+        Levenberg-Marquardt Optimizer with Huber loss.
+
+        Args:
+            params (iterable): Parameters to optimize.
+            lr (float): Learning rate scaling factor.
+            lambda_init (float): Initial damping factor.
+            max_iter (int): Maximum iterations per step.
+            huber_delta (float): The threshold parameter for Huber loss.
+        """
+        defaults = dict(lr=lr, lambda_=lambda_, max_iter=max_iter)
+        self.loss_scale = loss_scale
+        super(LMOptimizer, self).__init__(params, defaults)
+
+    def step(self, J: torch.Tensor, residuals: torch.Tensor):
+        """
+        Performs a single optimization step with Huber loss.
+
+        Args:
+            J (torch.Tensor): Jacobian matrix of shape (batch_size, num_residuals, num_params).
+            residuals (torch.Tensor): Residuals tensor of shape (batch_size, num_residuals).
+
+        Returns:
+            loss (torch.Tensor): The Huber loss.
+        """
+        with torch.no_grad():
+            # Compute gradient and Hessian
+            G = torch.einsum("bn,b->n", J, residuals * self.loss_scale)
+            H = torch.einsum("bn,bm->nm", J, J)
+
+            for group in self.param_groups:
+                lambda_ = group['lambda_']
+
+                params = group['params']
+                diag = H.diagonal(dim1=-2, dim2=-1)
+                diag = diag * lambda_
+
+                H = H + diag.clamp(min=1e-8).diag_embed()
+                try:
+                    delta = -torch.linalg.solve(H, G)
+                except RuntimeError:
+                    # In case JTJ is singular, use pseudo-inverse
+                    delta = -torch.matmul(torch.pinverse(H), G)
+                # Scale delta by learning rate
+                # delta = delta * lr
+
+                idx = 0
+                for p in params:
+                    numel = p.numel()
+                    if p.grad is not None:
+                        delta_p = delta[idx:idx+numel].view_as(p)
+                        p.add_(delta_p)
+                    idx += numel
+
 
 def se3_exp(xi):
     """
@@ -58,7 +114,7 @@ class PoseRefiner:
         self.device = device
 
         # set refinement strategy
-        if options.pose_refinement not in ['none', 'naive', 'mlp']:
+        if options.pose_refinement not in ['none', 'adamw', 'lm']:
             raise ValueError(f"Pose refinement strategy {options.pose_refinement} not supported")
         self.refinement_strategy = options.pose_refinement
 
@@ -66,6 +122,7 @@ class PoseRefiner:
         self.learning_rate = options.pose_refinement_lr
         self.update_weight = options.pose_refinement_weight
         self.orthonormalization = options.refinement_ortho
+        self.max_iter = options.iterations - options.pose_refinement_wait
 
         # pose buffer for current estimate of refined poses
         self.pose_buffer = None
@@ -80,9 +137,6 @@ class PoseRefiner:
         """
         Populate internal pose buffers and set up the pose optimization strategy.
         """
-        if self.refinement_strategy == 'mlp':
-            raise NotImplementedError("MLP refinement strategy is not implemented in this modification.")
-
         # Initialize pose_buffer_orig as SE(3) matrices
         self.pose_buffer_orig = torch.zeros(len(self.dataset), 4, 4).to(self.device)
 
@@ -94,11 +148,69 @@ class PoseRefiner:
             # No optimization needed; poses remain as original
             return
 
-        elif self.refinement_strategy == 'naive':
+        elif self.refinement_strategy == 'adamw':
             # Initialize delta pose_buffer as zeros (no change)
             self.pose_buffer = torch.zeros(len(self.dataset), 6, device=self.device, requires_grad=True)
-            # Set up optimizer to optimize delta poses
+            # Set up LM optimizer to optimize delta poses
             self.pose_optimizer = optim.AdamW([self.pose_buffer], lr=self.learning_rate)
+
+        elif self.refinement_strategy == 'lm':
+            # Initialize delta pose_buffer as zeros (no change)
+            self.pose_buffer = torch.zeros(len(self.dataset), 6, device=self.device, requires_grad=True)
+            # Set up LM optimizer to optimize delta poses
+            self.pose_optimizer = LMOptimizer([self.pose_buffer], lr=self.learning_rate, max_iter=self.max_iter)
+
+    def J_point_se3(self, pred_cam_coords_b31, pose_idx, Ks_b33):
+        if self.refinement_strategy != 'lm':
+            return None
+
+        pose_idx = pose_idx.flatten()
+        b = pred_cam_coords_b31.shape[0]
+        N = self.pose_buffer.shape[0]
+        device = pred_cam_coords_b31.device
+
+        X = pred_cam_coords_b31[:, 0, 0]
+        Y = pred_cam_coords_b31[:, 1, 0]
+        Z = pred_cam_coords_b31[:, 2, 0]
+        inv_z = 1.0 / Z
+        inv_z2 = inv_z ** 2
+        fx = Ks_b33[:, 0, 0]
+        fy = Ks_b33[:, 1, 1]
+
+        J11 = fx * X * Y * inv_z2
+        J12 = -fx - fx * X ** 2 * inv_z2
+        J13 = fx * Y * inv_z
+        J14 = -fx * inv_z
+        J15 = torch.zeros(b, device=device)
+        J16 = fx * X * inv_z2
+
+        J21 = fy + fy * Y ** 2 * inv_z2
+        J22 = -fy * X * Y * inv_z2
+        J23 = -fy * X * inv_z
+        J24 = torch.zeros(b, device=device)
+        J25 = -fy * inv_z
+        J26 = fy * Y * inv_z2
+
+        J_per_point = torch.stack([
+            torch.stack([J11, J12, J13, J14, J15, J16], dim=1),
+            torch.stack([J21, J22, J23, J24, J25, J26], dim=1)
+        ], dim=1)  # (b, 2, 6)
+
+        J_full = torch.zeros(2, 6 * N, device=device)  # (2, 6N)
+
+        col_offsets = torch.arange(6, device=device).unsqueeze(0)  # (1, 6)
+        cols = pose_idx.unsqueeze(1) * 6 + col_offsets  # (b, 6)
+
+        cols_flat = cols.reshape(-1)  # (b * 6,)
+
+        J0_flat = J_per_point[:, 0, :].reshape(-1)  # (b * 6,)
+        J1_flat = J_per_point[:, 1, :].reshape(-1)  # (b * 6,)
+
+        J_full[0].scatter_add_(0, cols_flat, J0_flat)
+        J_full[1].scatter_add_(0, cols_flat, J1_flat)
+
+        return J_full
+
 
     def get_all_original_poses(self):
         """
@@ -113,7 +225,7 @@ class PoseRefiner:
         if self.refinement_strategy == 'none':
             # Just return original poses
             return self.get_all_original_poses()
-        elif self.refinement_strategy == 'naive':
+        else:
             # Compute refined poses: delta_SE3 * original_pose
             delta_SE3 = se3_exp(self.pose_buffer)  # (N,4,4)
             refined_SE3 = torch.bmm(delta_SE3, self.pose_buffer_orig)  # (N,4,4)
@@ -129,7 +241,7 @@ class PoseRefiner:
         if self.refinement_strategy == 'none':
             # Just return original poses
             return original_poses_b44.clone()
-        elif self.refinement_strategy == 'naive':
+        else:
             # Get delta_xi for the specified poses
             delta_xi = self.pose_buffer[original_poses_indices.view(-1)].clone()  # (b,6)
             # Compute delta SE(3)
@@ -138,10 +250,16 @@ class PoseRefiner:
             refined_SE3 = torch.bmm(delta_SE3, original_poses_b44)  # (b,4,4)
             return refined_SE3
 
-    def zero_grad(self, set_to_none=False):
+    def zero_grad(self):
         if self.pose_optimizer is not None:
-            self.pose_optimizer.zero_grad(set_to_none=set_to_none)
+            # Manually zero the gradients of pose_buffer
+            self.pose_buffer.grad.zero_() if self.pose_buffer.grad is not None else None
 
-    def step(self):
-        if self.pose_optimizer is not None:
+    def step(self, J, residuals):
+        """
+        Performs a single optimization step.
+        """
+        if self.refinement_strategy == 'adamw':
             self.pose_optimizer.step()
+        elif self.refinement_strategy == 'lm':
+            self.pose_optimizer.step(J, residuals)

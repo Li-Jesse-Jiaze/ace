@@ -83,8 +83,8 @@ if __name__ == '__main__':
 
     # === Pose refinement ==================================================================================================
 
-    parser.add_argument('--refinement', type=str, default="mlp", choices=['mlp', 'none', 'naive'],
-                        help="How to refine poses. MLP: refinement network. Naive: Backprop to poses.")
+    parser.add_argument('--refinement', type=str, default="mlp", choices=['none', 'adamw', 'lm'],
+                        help="How to refine poses. LM: Levenberg-Marquardt. Naive: Backprop to poses.")
     parser.add_argument('--refinement_ortho', type=str, default="gram-schmidt", choices=['gram-schmidt', 'procrustes'],
                         help="How to orthonormalise rotations when refining poses.")
     parser.add_argument('--pose_refinement_wait', type=int, default=0,

@@ -535,9 +535,11 @@ class TrainerACE:
         # Project scene coordinates, either using refined or original intrinsics.
         if self.K_optimizer is not None:
             refined_Ks_scaled_b33 = self.K_optimizer.get_refined_calibration_matrices(Ks_b33)
-            pred_px_b31 = torch.bmm(refined_Ks_scaled_b33, pred_cam_coords_b31)
         else:
-            pred_px_b31 = torch.bmm(Ks_b33, pred_cam_coords_b31)
+            refined_Ks_scaled_b33 = Ks_b33.clone()
+
+        pred_px_b31 = torch.bmm(refined_Ks_scaled_b33, pred_cam_coords_b31)
+        J_point_se3 = self.pose_refiner.J_point_se3(pred_cam_coords_b31, pose_idx.int(), refined_Ks_scaled_b33)
 
         # Avoid division by zero.
         # Note: negative values are also clamped at +self.options.depth_min. The predicted pixel would be wrong,
@@ -618,7 +620,7 @@ class TrainerACE:
 
         # Set gradient buffers to zero.
         self.training_scheduler.zero_grad(set_to_none=True)
-        self.pose_refiner.zero_grad(set_to_none=True)
+        self.pose_refiner.zero_grad()
 
         if self.K_optimizer is not None:
             self.K_optimizer.zero_grad()
@@ -631,9 +633,9 @@ class TrainerACE:
         # Update the ACE network weights. Pass batch inliers to potentially go into cooldown.
         self.training_scheduler.step(batch_inliers)
 
-        if self.iteration > self.options.pose_refinement_wait:
+        if self.iteration > self.options.pose_refinement_wait and self.iteration % self.options.pose_refinement_f == 0:
             # Only update poses after initial wait period (if set)
-            self.pose_refiner.step()
+            self.pose_refiner.step(J_point_se3, reprojection_error_b2.sum(0))
 
         if self.K_optimizer is not None:
             # Only update calibration if it is being refined
