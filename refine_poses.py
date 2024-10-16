@@ -10,7 +10,7 @@ import roma
 _logger = logging.getLogger(__name__)
 
 class LMOptimizer(optim.Optimizer):
-    def __init__(self, params, lr=1e-3, lambda_init=1e-3, max_iter=20, huber_delta=1.0):
+    def __init__(self, params, lr=1e-3, lambda_=1e-3, max_iter=20, loss_scale=1e-2):
         """
         Levenberg-Marquardt Optimizer with Huber loss.
 
@@ -21,35 +21,9 @@ class LMOptimizer(optim.Optimizer):
             max_iter (int): Maximum iterations per step.
             huber_delta (float): The threshold parameter for Huber loss.
         """
-        defaults = dict(lr=lr, lambda_=lambda_init, max_iter=max_iter)
+        defaults = dict(lr=lr, lambda_=lambda_, max_iter=max_iter)
+        self.loss_scale = loss_scale
         super(LMOptimizer, self).__init__(params, defaults)
-        self.huber_delta = huber_delta
-
-    def huber(self, residuals):
-        """
-        Apply the Huber loss to the residuals.
-
-        Args:
-            residuals (torch.Tensor): The residuals tensor.
-
-        Returns:
-            torch.Tensor: Adjusted residuals.
-            torch.Tensor: Weights for each residual based on Huber derivative.
-        """
-        abs_res = torch.abs(residuals)
-        mask = abs_res <= self.huber_delta
-        adjusted_residuals = torch.where(
-            mask,
-            0.5 * residuals ** 2,
-            self.huber_delta * (abs_res - 0.5 * self.huber_delta),
-        )
-        # Derivative (for weighting)
-        weights = torch.where(
-            mask,
-            1.0,
-            self.huber_delta / abs_res
-        )
-        return adjusted_residuals, weights
 
     def step(self, J: torch.Tensor, residuals: torch.Tensor):
         """
@@ -63,22 +37,12 @@ class LMOptimizer(optim.Optimizer):
             loss (torch.Tensor): The Huber loss.
         """
         with torch.no_grad():
-            # Apply Huber loss to residuals
-            _, weights = self.huber(residuals)
-            # Optionally, you can compute the scalar loss here if needed
-            # loss = loss.mean()
-
-            # Weight the residuals and Jacobian
-            weighted_residuals = residuals * weights
-            weighted_J = J * weights.unsqueeze(-1)
-
             # Compute gradient and Hessian
-            G = torch.einsum("bn,b->n", weighted_J, residuals * 1e-2)
-            H = torch.einsum("bn,bm->nm", weighted_J, weighted_J)
+            G = torch.einsum("bn,b->n", J, residuals * self.loss_scale)
+            H = torch.einsum("bn,bm->nm", J, J)
 
             for group in self.param_groups:
                 lambda_ = group['lambda_']
-                lr = group['lr']
 
                 params = group['params']
                 diag = H.diagonal(dim1=-2, dim2=-1)
@@ -91,7 +55,7 @@ class LMOptimizer(optim.Optimizer):
                     # In case JTJ is singular, use pseudo-inverse
                     delta = -torch.matmul(torch.pinverse(H), G)
                 # Scale delta by learning rate
-                delta = delta * lr
+                # delta = delta * lr
 
                 idx = 0
                 for p in params:
@@ -221,30 +185,23 @@ class PoseRefiner:
         J25 = -fy * inv_z
         J26 = fy * Y * inv_z2
 
-        # Stack to form (b, 2, 6)
         J_per_point = torch.stack([
             torch.stack([J11, J12, J13, J14, J15, J16], dim=1),
             torch.stack([J21, J22, J23, J24, J25, J26], dim=1)
-        ], dim=1)  # Shape: (b, 2, 6)
+        ], dim=1)  # (b, 2, 6)
 
-        # Initialize J_full
-        J_full = torch.zeros((2 * b, 6 * N), device=device)  # Shape: (2b, 6N)
+        J_full = torch.zeros(2, 6 * N, device=device)  # (2, 6N)
 
-        # Create row indices for the two rows per point
-        rows0 = torch.arange(b, device=device)
-        rows1 = torch.arange(b, device=device) + 1  # Adjust based on how rows are mapped
+        col_offsets = torch.arange(6, device=device).unsqueeze(0)  # (1, 6)
+        cols = pose_idx.unsqueeze(1) * 6 + col_offsets  # (b, 6)
 
-        # Calculate the starting column indices
-        col_start = pose_idx * 6  # Assuming each pose index corresponds to 6 columns
+        cols_flat = cols.reshape(-1)  # (b * 6,)
 
-        # Expand to get all column indices for the 6 columns per pose
-        cols = col_start.unsqueeze(1) + torch.arange(6, device=device)  # Shape: (b, 6)
+        J0_flat = J_per_point[:, 0, :].reshape(-1)  # (b * 6,)
+        J1_flat = J_per_point[:, 1, :].reshape(-1)  # (b * 6,)
 
-        # Use index_add_ to add the first row of J_per_point
-        J_full.index_add_(0, rows0, torch.zeros((b, 6 * N), device=device).scatter_add(1, cols, J_per_point[:, 0, :]))
-
-        # Use index_add_ to add the second row of J_per_point
-        J_full.index_add_(0, rows1, torch.zeros((b, 6 * N), device=device).scatter_add(1, cols, J_per_point[:, 1, :]))
+        J_full[0].scatter_add_(0, cols_flat, J0_flat)
+        J_full[1].scatter_add_(0, cols_flat, J1_flat)
 
         return J_full
 

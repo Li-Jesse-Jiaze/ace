@@ -220,6 +220,9 @@ if __name__ == '__main__':
     parser.add_argument('--pose_refinement_wait', type=int, default=0,
                         help='start pose refinement after n iterations, can increase stability')
 
+    parser.add_argument('--pose_refinement_f', type=int, default=100,
+                        help='do pose refinement every n iterations')
+
     parser.add_argument('--pose_refinement_lr', type=float, default=0.001,
                         help='learning rate for the pose refinement')
 

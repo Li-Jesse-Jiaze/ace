@@ -633,9 +633,9 @@ class TrainerACE:
         # Update the ACE network weights. Pass batch inliers to potentially go into cooldown.
         self.training_scheduler.step(batch_inliers)
 
-        if self.iteration > self.options.pose_refinement_wait:
+        if self.iteration > self.options.pose_refinement_wait and self.iteration % self.options.pose_refinement_f == 0:
             # Only update poses after initial wait period (if set)
-            self.pose_refiner.step(J_point_se3, reprojection_error_b2.T.flatten())
+            self.pose_refiner.step(J_point_se3, reprojection_error_b2.sum(0))
 
         if self.K_optimizer is not None:
             # Only update calibration if it is being refined
