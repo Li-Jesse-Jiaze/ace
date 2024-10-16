@@ -364,7 +364,7 @@ class TrainerACE:
 
                     # Compute image features.
                     with autocast(enabled=self.options.use_half):
-                        features_BCHW = self.regressor.get_features(image_B1HW)
+                        features_BCHW, heatmap_B1HW = self.regressor.get_features(image_B1HW)
 
                     # Dimensions after the network's downsampling.
                     B, C, H, W = features_BCHW.shape
@@ -372,6 +372,8 @@ class TrainerACE:
                     # The image_mask needs to be downsampled to the actual output resolution and cast to bool.
                     image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
                     image_mask_B1HW = image_mask_B1HW.bool()
+                    # select patch based on reliability
+                    image_mask_B1HW &=  heatmap_B1HW > self.options.patch_threshold
 
                     # If the current mask has no valid pixels, continue.
                     if image_mask_B1HW.sum() == 0:

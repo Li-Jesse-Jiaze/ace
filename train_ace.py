@@ -77,6 +77,9 @@ if __name__ == '__main__':
 
     parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "xfeat.pt",
                         help='file containing pre-trained encoder weights')
+    
+    parser.add_argument('--patch_threshold', type=float, default=0.1,
+                        help='lowest reliability of image patch')
 
     parser.add_argument('--load_weights', type=Path, help='path to initialised network weights', default=None)
 
