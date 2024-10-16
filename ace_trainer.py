@@ -620,7 +620,7 @@ class TrainerACE:
 
         # Set gradient buffers to zero.
         self.training_scheduler.zero_grad(set_to_none=True)
-        self.pose_refiner.zero_grad(set_to_none=True)
+        self.pose_refiner.zero_grad()
 
         if self.K_optimizer is not None:
             self.K_optimizer.zero_grad()

@@ -210,8 +210,8 @@ if __name__ == '__main__':
 
     # === Pose refinement parameters ===================================================================================
 
-    parser.add_argument('--pose_refinement', type=str, default='none', choices=['none', 'naive'],
-                        help='refine poses with a neural network (mlp) or by back-propagation to poses (naive)')
+    parser.add_argument('--pose_refinement', type=str, default='none', choices=['none', 'adamw', 'lm'],
+                        help='How to refine poses. LM: Levenberg-Marquardt. Naive: Backprop to poses.')
 
     parser.add_argument('--pose_refinement_weight', type=float, default=0.1,
                         help='weight to scale the refiner pose updates, '
